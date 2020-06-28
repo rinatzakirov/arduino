@@ -15,10 +15,88 @@ Adafruit_SSD1306 display(OLED_RESET);
 #error("Height incorrect, please fix Adafruit_SSD1306.h!");
 #endif
 
+float calculate_hpres_torr(float v)
+{
+  if(v < 0.375)
+    return 0.0;
+  if(v < 2.842)
+    return - 0.02585 
+           + 0.03767  * v
+           + 0.04563  * v * v
+           + 0.1151   * v * v * v
+           - 0.04158  * v * v * v * v
+           + 0.008737 * v * v * v * v * v;
+  if(v < 4.945)
+    return  (0.1031 - 0.02322 * v + 0.07229 * v * v)
+          / (1 - 0.3986 * v + 0.07438 * v * v - 0.006866 * v * v * v);
+  if(v < 5.659)
+    return  (100.624 - 20.5623 * v)
+          / (1 - 0.37679 * v + 0.0348656 * v * v);
+  return 999.0;
+}
+
+float calculate_lpres_torr(float v)
+{
+  if(v < 10)
+    return pow(10, v) * 1e-9;
+  return 999.0;
+}
+
+char * units(float num)
+{
+  static char buf[10];
+  int pos = 0;
+  int e = 0;
+  while(num < 1.0 && e < 4)
+  {
+    num *= 1000.0;
+    e += 1;
+  }
+  bool start = false;
+  int n;
+  n = int(num / 100.0); 
+  buf[pos++] = (n != 0 | start) ? ('0' + n) : (' ');
+  start |= n != 0;
+  num -= n * 100.0;
+
+  n = int(num / 10.0); 
+  buf[pos++] = (n != 0 | start) ? ('0' + n) : (' ');
+  start |= n != 0;
+  num -= n * 10.0;
+
+  n = int(num / 1.0); 
+  buf[pos++] = ('0' + n);
+  num -= n * 1.0;
+
+  buf[pos++] = '.';
+
+  n = int(num / 0.1); 
+  buf[pos++] = ('0' + n);
+  num -= n * 0.1;
+
+  if(e == 0)
+    buf[pos++] = ' ';
+  if(e == 1)
+    buf[pos++] = 'm';
+  if(e == 2)
+    buf[pos++] = 'u';
+  if(e == 3)
+    buf[pos++] = 'n';
+  if(e == 4)
+    buf[pos++] = 'p';
+
+  buf[pos++] = 'T';
+  buf[pos++] = '\0';
+
+  return buf;
+}
+
+unsigned char lpres_on = 0, lpres_en = 0;
+float lpres = 0.001, hpres = 0.000755;
 unsigned char mode = 0;
 uint8_t pump_set_volt = 50; // 5.0 volt
 bool active = false;
-#define MODES 3
+#define MODES 5
 
 void setup()   {                
   Serial.begin(9600);
@@ -31,11 +109,15 @@ void setup()   {
 
   pinMode(PA0, INPUT);
   pinMode(PA1, INPUT);
+  pinMode(PA2, INPUT);
+  pinMode(PA3, INPUT);
 
   pinMode(PA7, OUTPUT);
 
   pinMode(PB12, OUTPUT);   
   digitalWrite(PB12, LOW);
+
+  pinMode(PB5, OUTPUT);
 
   pinMode(PA8, INPUT_PULLUP);           // set pin to input
   pinMode(PA9, INPUT_PULLUP);           // set pin to input
@@ -47,12 +129,12 @@ void setup()   {
   display.setTextColor(WHITE);
   display.setCursor(0,0);
   display.print("Ver: ");
-  display.println(1.00);
+  display.println(1.01);
   display.display();
   delay(1000);
   display.clearDisplay();
 
-  mode = EEPROM.read(0);
+  mode = 1;//EEPROM.read(0);
   if(mode < 0) mode = 0;
   mode = mode % MODES;
   pump_set_volt = EEPROM.read(1);
@@ -113,10 +195,20 @@ void set_row(int row)
     display.println("");
 }
 
-float pump_volt;
+float pwr_volt, pump_volt, hpres_volt, lpres_volt;
+
 void loop() {
+  float pwr_volt1 = analogRead(PA0) * 11 / 1000.0;
+  pwr_volt = 0.8 * pwr_volt + 0.2 * pwr_volt1;
+  
   float pump_volt1 = analogRead(PA1) * 4.1 * 0.852564 / 1000.0;
   pump_volt = 0.92 * pump_volt + 0.08 * pump_volt1;
+
+  float hpres_volt1 = analogRead(PA2) * 1.5007 / 1000.0 + 0.035;
+  hpres_volt = 0.93 * hpres_volt + 0.07 * hpres_volt1;
+
+  float lpres_volt1 = analogRead(PA3) * 2.614576 / 1000.0 + 0.035;
+  lpres_volt = 0.93 * lpres_volt + 0.07 * lpres_volt1;
 
   if(pump_run)
   {
@@ -134,7 +226,14 @@ void loop() {
     pump_act = false;
   }
 
+  hpres = calculate_hpres_torr(hpres_volt);
+  lpres = calculate_lpres_torr(lpres_volt);
+
+  if(hpres > 1.0) pump_act = false;
   digitalWrite(PA7, pump_act ? 1 : 0);
+
+  lpres_on = (lpres_en == 1 && hpres < 0.002 && hpres_volt > 0.3 && pump_run) ? 1 : 0;
+  digitalWrite(PB5, lpres_on);
 
   display.clearDisplay();
   display.setTextSize(2);
@@ -198,14 +297,24 @@ void loop() {
   if(active)\
     display.setTextColor(WHITE);
 
-  ACTB();
-  display.print("M");
-  display.print(mode);
-  ACTE(); 
-  display.print(" ");
-  
-  //if(mode == 0)
+  if(mode == 0)
   {
+    display.print("HP:");
+    display.println(units(hpres));
+    display.print("LP:");
+    display.println(units(lpres));
+    display.print("PMP: ");
+    display.print(pump_volt);
+    display.println('v');
+  }
+  else
+  {
+    ACTB();
+    display.print("M");
+    display.print(mode);
+    ACTE();
+    display.print(" ");
+  
     display.print("B:");
     display.print((btns & B0 ) ? 1 : 0);
     display.print((btns & B1 ) ? 1 : 0);
@@ -213,32 +322,52 @@ void loop() {
     display.print((sws & SW1) ? 1 : 0);
     display.println("");
   }
-  if(mode == 0)
+  
+  if(mode == 1)
   {  
-    display.print("PWR: ");
-    display.println(analogRead(PA0) * 11 / 1000.0);
+    display.print("PWR:");
+    display.print(pwr_volt);
+    display.println('v');
     display.print("PMP: ");
-    display.println(pump_volt);
+    display.print(pump_volt);
+    display.println('v');
   }
 
-  if(mode == 1)
+  if(mode == 2)
   {
     ACTB();
     display.println("Pump Set");
-    display.println(pump_set_volt / 10.0);
+    display.print(pump_set_volt / 10.0);
+    display.println('v');
     ACTE();
     pump_set_volt += change * 2;
+  }
+
+  if(mode == 3)
+  {
+    ACTB();
+    display.println("LowPres En");
+    display.println(lpres_en);
+    ACTE();
+    lpres_en += change;
+    lpres_en = (lpres_en + 2) % 2;
+  }
+
+  if(mode == 4)
+  {
+    display.print("HPV: ");
+    display.println(hpres_volt, 3);
+    display.print("LPV: ");
+    display.println(lpres_volt, 3);
   }
 
   //if(mode == 0)
   {
     set_row(3);
-    display.print("PMP:");
-    //ACTB();
+    display.print("P:");
     display.print(pump_run);
-    //ACTE();
-    display.print(pump_act ? " ACT" : "");
-    //pump_run ^= change ? 1 : 0;
+    display.print(pump_act ? " ACT" : "    ");
+    display.print(lpres_on == 1 ? " LP" : (lpres_en == 1 ? " .." : "   "));
   }
 
   if(btns != last_btns)
